@@ -83,22 +83,15 @@ boolean SFE_UBLOX_GPS::begin(Stream &serialPort)
 
 //Enable or disable the printing of sent/response HEX values.
 //Use this in conjunction with 'Transport Logging' from the Universal Reader Assistant to see what they're doing that we're not
-void SFE_UBLOX_GPS::enableDebugging(Stream &debugPort, boolean printLimitedDebug)
+void SFE_UBLOX_GPS::enableDebugging(Stream &debugPort)
 {
   _debugSerial = &debugPort; //Grab which port the user wants us to use for debugging
-  if (printLimitedDebug == false)
-  {
-    _printDebug = true; //Should we print the commands we send? Good for debugging
-  }
-  else
-  {
-    _printLimitedDebug = true; //Should we print limited debug messages? Good for debugging high navigation rates
-  }
+
+  _printDebug = true; //Should we print the commands we send? Good for debugging
 }
 void SFE_UBLOX_GPS::disableDebugging(void)
 {
   _printDebug = false; //Turn off extra print statements
-  _printLimitedDebug = false;
 }
 
 //Safely print messages
@@ -309,9 +302,9 @@ boolean SFE_UBLOX_GPS::checkUbloxI2C(ubxPacket *incomingUBX, uint8_t requestedCl
       if (lsb == 0xFF)
       {
         //I believe this is a Ublox bug. Device should never present an 0xFF.
-        if ((_printDebug == true) || (_printLimitedDebug == true)) // Print this if doing limited debugging
+        if (_printDebug == true)
         {
-          _debugSerial->println(F("checkUbloxI2C: Ublox bug, length lsb is 0xFF"));
+          _debugSerial->println(F("checkUbloxI2C: Ublox bug, no bytes available"));
         }
         if (checksumFailurePin >= 0)
         {
@@ -343,7 +336,7 @@ boolean SFE_UBLOX_GPS::checkUbloxI2C(ubxPacket *incomingUBX, uint8_t requestedCl
       //Clear the MSbit
       bytesAvailable &= ~((uint16_t)1 << 15);
 
-      if ((_printDebug == true) || (_printLimitedDebug == true)) // Print this if doing limited debugging
+      if (_printDebug == true)
       {
         _debugSerial->print(F("checkUbloxI2C: Bytes available error:"));
         _debugSerial->println(bytesAvailable);
@@ -402,7 +395,7 @@ boolean SFE_UBLOX_GPS::checkUbloxI2C(ubxPacket *incomingUBX, uint8_t requestedCl
           {
             if (incoming == 0x7F)
             {
-              if ((_printDebug == true) || (_printLimitedDebug == true)) // Print this if doing limited debugging
+              if (_printDebug == true)
               {
                 _debugSerial->println(F("checkUbloxU2C: Ublox error, module not ready with data"));
               }
@@ -816,7 +809,7 @@ void SFE_UBLOX_GPS::processUBX(uint8_t incoming, ubxPacket *incomingUBX, uint8_t
         incomingUBX->classAndIDmatch = SFE_UBLOX_PACKET_VALIDITY_NOT_VALID; // If we have a match, set the classAndIDmatch flag to not valid
       }
 
-      if ((_printDebug == true) || (_printLimitedDebug == true)) // Print this if doing limited debugging
+      if (_printDebug == true)
       {
         //Drive an external pin to allow for easier logic analyzation
         if (checksumFailurePin >= 0)
@@ -937,6 +930,55 @@ void SFE_UBLOX_GPS::processUBXpacket(ubxPacket *msg)
       moduleQueried.groundSpeed = true;
       moduleQueried.headingOfMotion = true;
       moduleQueried.pDOP = true;
+    }
+    else if (msg->id == UBX_NAV_RELPOSNED && msg->len == 64)
+    {
+        //We got a response, now parse the bits
+
+        uint16_t refStationID = extractInt(2);
+        //_debugSerial->print(F("refStationID: "));
+        //_debugSerial->println(refStationID));
+
+        int32_t tempRelPos;
+
+        tempRelPos = extractLong(8);
+        relPosInfo.relPosN = tempRelPos / 100.0; //Convert cm to m
+
+        tempRelPos = extractLong(12);
+        relPosInfo.relPosE = tempRelPos / 100.0; //Convert cm to m
+
+        tempRelPos = extractLong(16);
+        relPosInfo.relPosD = tempRelPos / 100.0; //Convert cm to m
+
+        relPosInfo.relPosLength = extractLong(20);
+        relPosInfo.relPosHeading = extractLong(24);
+
+        relPosInfo.relPosHPN = payloadCfg[32];
+        relPosInfo.relPosHPE = payloadCfg[33];
+        relPosInfo.relPosHPD = payloadCfg[34];
+        relPosInfo.relPosHPLength = payloadCfg[35];
+
+        uint32_t tempAcc;
+
+        tempAcc = extractLong(36);
+        relPosInfo.accN = tempAcc / 10000.0; //Convert 0.1 mm to m
+
+        tempAcc = extractLong(40);
+        relPosInfo.accE = tempAcc / 10000.0; //Convert 0.1 mm to m
+
+        tempAcc = extractLong(44);
+        relPosInfo.accD = tempAcc / 10000.0; //Convert 0.1 mm to m
+
+        uint8_t flags = payloadCfg[60];
+
+        relPosInfo.gnssFixOk = flags & (1 << 0);
+        relPosInfo.diffSoln = flags & (1 << 1);
+        relPosInfo.relPosValid = flags & (1 << 2);
+        relPosInfo.carrSoln = (flags & (0b11 << 3)) >> 3;
+        relPosInfo.isMoving = flags & (1 << 5);
+        relPosInfo.refPosMiss = flags & (1 << 6);
+        relPosInfo.refObsMiss = flags & (1 << 7);
+
     }
     else if (msg->id == UBX_NAV_HPPOSLLH && msg->len == 36)
     {
@@ -1147,17 +1189,19 @@ boolean SFE_UBLOX_GPS::isConnected(uint16_t maxWait)
   if (commType == COMM_TYPE_I2C)
   {
     _i2cPort->beginTransmission((uint8_t)_gpsI2Caddress);
-    if (_i2cPort->endTransmission() != 0)
-      return false; //Sensor did not ack
+    return _i2cPort->endTransmission() == 0;
   }
+  else if (commType == COMM_TYPE_SERIAL)
+  {
+    // Query navigation rate to see whether we get a meaningful response
+    packetCfg.cls = UBX_CLASS_CFG;
+    packetCfg.id = UBX_CFG_RATE;
+    packetCfg.len = 0;
+    packetCfg.startingSpot = 0;
 
-  // Query navigation rate to see whether we get a meaningful response
-  packetCfg.cls = UBX_CLASS_CFG;
-  packetCfg.id = UBX_CFG_RATE;
-  packetCfg.len = 0;
-  packetCfg.startingSpot = 0;
-
-  return (sendCommand(&packetCfg, maxWait) == SFE_UBLOX_STATUS_DATA_RECEIVED); // We are polling the RATE so we expect data and an ACK
+    return (sendCommand(&packetCfg, maxWait) == SFE_UBLOX_STATUS_DATA_RECEIVED); // We are polling the RATE so we expect data and an ACK
+  }
+  return false;
 }
 
 //Given a message, calc and store the two byte "8-Bit Fletcher" checksum over the entirety of the message
@@ -1217,6 +1261,8 @@ void SFE_UBLOX_GPS::printPacket(ubxPacket *packet)
     _debugSerial->print(F(" ID:"));
     if (packet->cls == UBX_CLASS_NAV && packet->id == UBX_NAV_PVT)
       _debugSerial->print(F("PVT"));
+    else if (packet->cls == UBX_CLASS_NAV && packet->id == UBX_NAV_RELPOSNED)
+      _debugSerial->print(F("RELPOS"));
     else if (packet->cls == UBX_CLASS_CFG && packet->id == UBX_CFG_RATE)
       _debugSerial->print(F("RATE"));
     else if (packet->cls == UBX_CLASS_CFG && packet->id == UBX_CFG_CFG)
@@ -2010,20 +2056,15 @@ boolean SFE_UBLOX_GPS::setSurveyMode(uint8_t mode, uint16_t observationTime, flo
     packetCfg.payload[x] = 0;
 
   //payloadCfg should be loaded with poll response. Now modify only the bits we care about
-  payloadCfg[2] = mode; //Set mode. Survey-In and Disabled are most common. Use ECEF (not LAT/LON/ALT).
+  payloadCfg[2] = mode; //Set mode. Survey-In and Disabled are most common.
 
-  //svinMinDur is U4 (uint32_t) but we'll only use a uint16_t (waiting more than 65535 seconds seems excessive!)
   payloadCfg[24] = observationTime & 0xFF; //svinMinDur in seconds
   payloadCfg[25] = observationTime >> 8;   //svinMinDur in seconds
-  payloadCfg[26] = 0;                      //Truncate to 16 bits
-  payloadCfg[27] = 0;                      //Truncate to 16 bits
 
-  //svinAccLimit is U4 (uint32_t) in 0.1mm.
-  uint32_t svinAccLimit = (uint32_t)(requiredAccuracy * 10000.0); //Convert m to 0.1mm
-  payloadCfg[28] = svinAccLimit & 0xFF;                           //svinAccLimit in 0.1mm increments
+  uint32_t svinAccLimit = requiredAccuracy * 10000; //Convert m to 0.1mm
+  payloadCfg[28] = svinAccLimit & 0xFF;             //svinAccLimit in 0.1mm increments
   payloadCfg[29] = svinAccLimit >> 8;
   payloadCfg[30] = svinAccLimit >> 16;
-  payloadCfg[31] = svinAccLimit >> 24;
 
   return ((sendCommand(&packetCfg, maxWait)) == SFE_UBLOX_STATUS_DATA_SENT); // We are only expecting an ACK
 }
@@ -2060,25 +2101,13 @@ boolean SFE_UBLOX_GPS::getSurveyStatus(uint16_t maxWait)
     return (false);                                                         //If command send fails then bail
 
   //We got a response, now parse the bits into the svin structure
+  svin.observationTime = extractLong(8);
 
-  //dur (Passed survey-in observation time) is U4 (uint32_t) seconds. We truncate to 16 bits
-  //(waiting more than 65535 seconds (18.2 hours) seems excessive!)
-  uint32_t tmpObsTime = extractLong(8);
-  if (tmpObsTime <= 0xFFFF)
-  {
-    svin.observationTime = (uint16_t)tmpObsTime;
-  }
-  else
-  {
-    svin.observationTime = 0xFFFF;
-  }
-
-  // meanAcc is U4 (uint32_t) in 0.1mm. We convert this to float.
   uint32_t tempFloat = extractLong(28);
-  svin.meanAccuracy = ((float)tempFloat) / 10000.0; //Convert 0.1mm to m
+  svin.meanAccuracy = tempFloat / 10000.0; //Convert 0.1mm to m
 
-  svin.valid = payloadCfg[36];  //1 if survey-in position is valid, 0 otherwise
-  svin.active = payloadCfg[37]; //1 if survey-in in progress, 0 otherwise
+  svin.valid = payloadCfg[36];
+  svin.active = payloadCfg[37]; //1 if survey in progress, 0 otherwise
 
   return (true);
 }
